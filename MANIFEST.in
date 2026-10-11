@@ -1,0 +1,7 @@
+include CONTRIBUTING.md PUBLICATION_CHECKLIST.md SECURITY.md VALIDATION.md RELEASING.md
+recursive-include docs *.md
+recursive-include tests *.py
+recursive-include scripts *.py
+global-exclude __pycache__ *.py[cod]
+prune artifacts
+prune .github

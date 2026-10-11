@@ -1,0 +1,1 @@
+"""AutoSpan user-facing adapters."""

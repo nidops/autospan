@@ -86,15 +86,21 @@ Ctrl+C requests cooperative cancellation in Textual. Handlers can use
 `ctx.cancel_requested`, `ctx.wait(seconds)` or `ctx.check_cancelled()`.
 A handler must finish stopping its driver/context managers before acknowledging
 cancellation. An acknowledged cancellation returns status 130. The console stays
-open for the next command. At an idle Textual prompt, Ctrl+C leaves the input
-unchanged; use Ctrl+Q to quit.
+open for the next command. At an idle Textual prompt, Ctrl+C clears the command
+draft, resets history navigation and records `^C` without logging the discarded
+input. It also closes log search and restores unfiltered output; Escape closes
+search while preserving the command draft. Idle Ctrl+C leaves an open command
+palette untouched. While a command is running or its final output is draining,
+Ctrl+C preserves the draft. Use Ctrl+Q to quit.
 
 Ctrl+Q requests cancellation and quits **after the command thread finishes**.
 Forced UI exit also joins the worker before runtime teardown. A driver that
 cannot interrupt an operation is allowed to finish; there is no timeout that
 abandons a live hardware worker. Such an operation can finish successfully after
 a stop request. In the plain REPL, Ctrl+C during a handler returns 130 after its
-stack unwinds; Ctrl+C at an idle prompt leaves the session.
+stack unwinds. Ctrl+C at an idle plain prompt keeps the session and its acquired
+components open. Use `exit`, `quit` or EOF to leave: typically Ctrl+D on Unix, or
+Ctrl+Z then Enter in the Windows console.
 
 Handlers must join their own child workers and must not start another test run,
 runtime session or hardware owner. Runtime periodic workers remain owned by the
@@ -109,6 +115,19 @@ canonical session.
   built-ins and plugin commands; selecting one fills the prompt. Ctrl+P remains
   the reliable default.
 - Ctrl+F searches retained log lines; Enter filters, an empty search restores them.
+  Escape from the search field or command prompt closes search, clears the filter
+  and restores retained output. It also works after pressing Enter to apply a search.
+- Ctrl+B toggles the details sidebar. On terminals narrower than 90 columns, the
+  sidebar automatically hides so the command log remains useful. A manual toggle
+  overrides automatic resizing for the remainder of the session.
+- Ctrl+G closes search, clears any filter and scrolls to the newest unfiltered
+  output, returning focus to the prompt. The command draft is preserved.
+- A command submitted while another runs is never queued or discarded: the
+  typed input remains ready for explicit submission after the worker finishes.
+- The sidebar shows elapsed time for the active or most recent command worker.
+  Timing stops when the worker finishes, even while remaining output is rendered.
+  It includes dispatch, evidence handling and any output backpressure; it is not
+  a measurement of hardware execution time alone.
 - Ctrl+Y copies retained text using the terminal clipboard protocol.
 - Ctrl+S explicitly exports UTF-8 `console.log` in the evidence directory; use this
   when the terminal does not support clipboard transfer.
@@ -116,6 +135,8 @@ canonical session.
 The output queue is bounded to 128 chunks of at most 2048 characters and applies
 backpressure. Rendering drains a limited batch on the UI thread. Logs retain
 1000 lines (at most 4096 characters each); history retains 100 paths.
+Output chunks are reassembled into lines before display; CRLF is normalized,
+blank lines are preserved, and long lines are split into display segments.
 Arguments are excluded from automatic history, command echoes and evidence
 labels. Error diagnostics replace exact argument values, including values after
 `=`. This does not redact secrets obtained from configuration, environment variables

@@ -109,9 +109,12 @@ def run_console(
                 while True:
                     try:
                         line = input("autospan> ")
-                    except (EOFError, KeyboardInterrupt):
+                    except EOFError:
                         print()
                         break
+                    except KeyboardInterrupt:
+                        print("\n^C (session stays open; type 'exit' or 'quit' to leave)")
+                        continue
                     outcome = shell.execute(line)
                     result = shell.status
                     if readline is not None and line.strip():

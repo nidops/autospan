@@ -329,6 +329,52 @@ def test_plain_repl_retains_failure_after_success_and_quit(tmp_path, monkeypatch
     assert json.loads(manifest.read_text())["outcome"] == "failed"
 
 
+@pytest.mark.parametrize("exit_input", ["exit", "quit", EOFError()])
+def test_idle_interrupt_preserves_live_session_and_previous_failure(
+    tmp_path, monkeypatch, exit_input
+):
+    from contextlib import contextmanager
+
+    order = []
+    device = object()
+
+    class Factory:
+        @contextmanager
+        def open(self, context, dependencies, config):
+            order.append("open")
+            try:
+                yield device
+            finally:
+                order.append("close")
+
+    def command(ctx, args):
+        assert ctx.runtime.get("device") is device
+        order.append(args[0])
+        return 4 if args == ("fail",) else 0
+
+    inputs = iter(("go fail", KeyboardInterrupt(), "go success", exit_input))
+
+    def read(prompt):
+        value = next(inputs)
+        assert "close" not in order
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    monkeypatch.setattr("builtins.input", read)
+    monkeypatch.setattr("autospan.frontends.console._enable_line_editing", lambda shell: None)
+    host = HostBuild(
+        (),
+        RuntimePlan((ComponentSpec("device", "device"),)),
+        {"device": Factory()},
+        (CommandContribution(("go",), command),),
+    )
+    assert run_console(host=host, evidence_root=tmp_path, plain=True) == 4
+    assert order == ["open", "fail", "success", "close"]
+    (manifest,) = tmp_path.glob("*/manifest.json")
+    assert json.loads(manifest.read_text())["outcome"] == "failed"
+
+
 def test_console_manual_command_definition_runs(tmp_path):
     manual = Path(__file__).resolve().parents[1] / "docs" / "CONSOLE.md"
     (definition,) = re.findall(r"```python\n(.*?)\n```", manual.read_text(encoding="utf-8"), re.S)

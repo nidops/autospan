@@ -5,12 +5,14 @@ from __future__ import annotations
 import contextvars
 import queue
 import threading
+import time
 from collections import deque
 from functools import partial
 from pathlib import Path
 from typing import cast
 
 from autospan.api import CommandOutcome, CommandShell, Completion
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import DiscoveryHit, Hit, Hits, Provider
@@ -18,6 +20,7 @@ from textual.containers import Horizontal
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
 from autospan.frontends.tui.editing import History
+from autospan.frontends.tui.streaming import LineAssembler
 
 
 class PromptInput(Input):
@@ -157,6 +160,8 @@ class ConsoleApp(App[int]):
         Binding("ctrl+f", "search_log", "search log", priority=True),
         Binding("ctrl+y", "copy_log", "copy log", priority=True),
         Binding("ctrl+s", "export_log", "export log", priority=True),
+        Binding("ctrl+b", "toggle_sidebar", "sidebar", priority=True),
+        Binding("ctrl+g", "follow_log", "latest output", priority=True),
     ]
 
     def __init__(self, shell: CommandShell, components: tuple[str, ...] = ()) -> None:
@@ -174,9 +179,14 @@ class ConsoleApp(App[int]):
         self._outcome: CommandOutcome | None = None
         self._quit_requested = False
         self._log_text: deque[str] = deque(maxlen=1000)
+        self._stream = LineAssembler(max_line=4096)
         self._filter = ""
         self._status_text = ""
         self._failure_diagnostic = ""
+        self._sidebar_override: bool | None = None
+        self._started_at: float | None = None
+        self._finished_at: float | None = None
+        self._last_duration: float | None = None
 
     @property
     def status(self) -> int:
@@ -215,22 +225,37 @@ class ConsoleApp(App[int]):
 
     def on_mount(self) -> None:
         self.record(
-            "help / Tab cycles / Ctrl+P or Ctrl+Space commands; Ctrl+C stops; Ctrl+Q quits."
+            "help / Tab completes / Ctrl+P picks / Ctrl+F searches / "
+            "Ctrl+B toggles details / Ctrl+C stops / Ctrl+Q quits"
         )
         self._prompt.focus()
         self.set_interval(0.02, self._drain_output)
+        self._refresh_sidebar()
         self._update_status()
 
+    def on_resize(self, event: events.Resize) -> None:
+        # Keep the command log readable on an 80-column terminal. The operator
+        # can explicitly override the automatic compact layout with Ctrl+B.
+        if hasattr(self, "_side"):
+            self._refresh_sidebar(width=event.size.width)
+
+    def _refresh_sidebar(self, *, width: int | None = None) -> None:
+        visible = self._sidebar_override
+        if width is None:
+            width = self.size.width
+        self._side.display = width >= 90 if visible is None else visible
+
+    def _record_line(self, line: str) -> None:
+        """Retain and render one display line, including deliberate blank lines."""
+        self._log_text.append(line)
+        if not self._filter or self._filter in line.casefold():
+            self._log_view.write(line)
+
     def record(self, text: str) -> None:
-        """Record/render on the UI thread only; limit individual retained lines too."""
-        log = self._log_view
+        """Record UI messages; command output uses the framing path below."""
         for line in text.splitlines():
-            # Built-ins and completion suggestions also obey the retention bound.
             for start in range(0, max(1, len(line)), 4096):
-                chunk = line[start : start + 4096]
-                self._log_text.append(chunk)
-                if not self._filter or self._filter in chunk.casefold():
-                    log.write(chunk)
+                self._record_line(line[start : start + 4096])
 
     def _enqueue_output(self, text: str) -> None:
         # Blocking put supplies backpressure. Both normal timers and emergency
@@ -247,29 +272,30 @@ class ConsoleApp(App[int]):
         event.stop()
         if event.input.id == "search":
             self._filter = event.value.casefold()
-            log = self._log_view
-            log.clear()
-            for line in self._log_text:
-                if not self._filter or self._filter in line.casefold():
-                    log.write(line)
+            self._render_log()
             self._prompt.focus()
             return
         line = event.value.strip()
-        event.input.value = ""
         if not line:
             return
         if self._thread is not None:
-            self.record("command running; wait or press Ctrl+C to request cancellation")
+            # Don't eat a command an operator typed while waiting for hardware.
+            # In particular, never queue it for automatic execution later.
+            self.record("command running; input kept for later (Ctrl+C requests stop)")
             return
+        event.input.value = ""
         self._active_label = self.shell.label(line)
         self._history.add(self._active_label)
         self.record(f"> {self._active_label}")
         self._completed.clear()
         self._cancel_request = threading.Event()
         self._outcome = None
+        self._started_at = None
+        self._finished_at = None
         context = contextvars.copy_context()
 
         def execute() -> None:
+            self._started_at = time.monotonic()
             try:
                 self._outcome = context.run(
                     self.shell.execute,
@@ -282,6 +308,8 @@ class ConsoleApp(App[int]):
                 self._enqueue_output(diagnostic + "\n")
                 self._outcome = CommandOutcome(2, diagnostic=diagnostic, error=exc)
             finally:
+                # Freeze duration before the UI drains any remaining output.
+                self._finished_at = time.monotonic()
                 self._completed.set()
 
         self._thread = threading.Thread(target=execute, name="autospan-console-command")
@@ -293,10 +321,15 @@ class ConsoleApp(App[int]):
             return
         for _ in range(8):
             try:
-                self.record(self._output.get_nowait())
+                chunk = self._output.get_nowait()
             except queue.Empty:
                 break
+            for line in self._stream.push(chunk):
+                self._record_line(line)
         if self._thread is not None and self._completed.is_set() and self._output.empty():
+            # A handler may have written a final line without a newline.
+            for line in self._stream.finish():
+                self._record_line(line)
             self._thread.join()
             self._thread = None
             self._accept_outcome()
@@ -307,6 +340,9 @@ class ConsoleApp(App[int]):
 
     def _accept_outcome(self) -> None:
         outcome = self._outcome
+        if self._started_at is not None and self._finished_at is not None:
+            self._last_duration = self._finished_at - self._started_at
+            self._started_at = None
         if outcome is None:
             return
         self._last_status = outcome.status
@@ -317,10 +353,17 @@ class ConsoleApp(App[int]):
         self._active_label = ""
 
     def _update_status(self) -> None:
+        finished = self._finished_at if self._completed.is_set() else None
+        elapsed = (
+            (finished if finished is not None else time.monotonic()) - self._started_at
+            if self._started_at is not None
+            else self._last_duration
+        )
         parts = [
             f"State: {self.operation_state}",
             f"Operation: {self._active_label or '-'}",
             f"Last status: {self._last_status if self._last_status is not None else '-'}",
+            f"Elapsed: {elapsed:.1f}s" if elapsed is not None else "Elapsed: -",
             "",
             "Components",
             *(f"  {name}" for name in self._components),
@@ -334,10 +377,25 @@ class ConsoleApp(App[int]):
             self._status_text = text
 
     def action_cancel_command(self) -> None:
-        if self._thread is not None and not self._completed.is_set():
-            self._cancel_request.set()
-            self.record("Stopping requested; waiting for the operation to stop or finish.")
-            self._update_status()
+        if self._thread is not None:
+            if not self._completed.is_set():
+                self._cancel_request.set()
+                self.record("Stopping requested; waiting for the operation to stop or finish.")
+                self._update_status()
+            return
+
+        # Only clear idle input on the main console screen.
+        # Never interfere with an active modal or worker teardown.
+        if self.screen is not self._prompt.screen:
+            return
+
+        if self._search.display:
+            self._close_search()
+
+        self._prompt._set("")
+        self._history.add("")
+        self.record("^C")
+        self._prompt.focus()
 
     def action_quit_console(self) -> None:
         self._quit_requested = True
@@ -353,6 +411,39 @@ class ConsoleApp(App[int]):
         search = self._search
         search.display = True
         search.focus()
+
+    def on_key(self, event: events.Key) -> None:
+        if (
+            event.key == "escape"
+            and self._search.display
+            and self.screen is self._search.screen
+            and (self._search.has_focus or self._prompt.has_focus)
+        ):
+            self._close_search()
+            event.stop()
+            event.prevent_default()
+
+    def _render_log(self) -> None:
+        self._log_view.clear()
+        for line in self._log_text:
+            if not self._filter or self._filter in line.casefold():
+                self._log_view.write(line)
+
+    def _close_search(self) -> None:
+        self._search.display = False
+        self._search.value = ""
+        if self._filter:
+            self._filter = ""
+            self._render_log()
+        self._prompt.focus()
+
+    def action_toggle_sidebar(self) -> None:
+        self._sidebar_override = not self._side.display
+        self._refresh_sidebar()
+
+    def action_follow_log(self) -> None:
+        self._close_search()
+        self._log_view.scroll_end(animate=False)
 
     def action_copy_log(self) -> None:
         self.copy_to_clipboard(self.retained_log)

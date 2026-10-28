@@ -264,7 +264,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return int(frontend.handler(context, passthrough) or 0)
     except AutoSpanError as exc:
-        print(f"autospan: {exc}")
+        print(f"autospan: {exc}", file=sys.stderr)
         return 2
     return 2
 

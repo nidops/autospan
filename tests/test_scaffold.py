@@ -53,3 +53,17 @@ def test_generated_plugin_tests_pass(tmp_path) -> None:
         text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_generated_dependency_accepts_current_release_without_downgrade(tmp_path):
+    import tomllib
+    from packaging.requirements import Requirement
+
+    root = new_project("release-check", tmp_path)
+    project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+    requirement = next(
+        Requirement(value) for value in project["dependencies"] if value.startswith("autospan")
+    )
+    assert "0.2.0" in requirement.specifier
+    assert "0.1.0.post1" not in requirement.specifier
+    assert project["version"] == "0.1.0"  # The new plugin has its own version.

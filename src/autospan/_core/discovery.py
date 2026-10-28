@@ -86,8 +86,8 @@ def _validate_and_register(
         raise PluginError(
             f"Plugin {requested_name!r} targets AutoSpan plugin API {descriptor.api_version}, "
             f"host {AUTOSPAN_PLUGIN_API_VERSION} supports: {supported}. "
-            "Migrate command handlers to (CommandContext, args), use ctx.runtime/ctx.write, "
-            "and update the plugin descriptor. See docs/CONSOLE.md."
+            "Install compatible host/plugin versions or migrate the plugin to a supported API. "
+            "Changing the descriptor alone does not establish compatibility. See docs/PLUGIN_AUTHORING.md."
         )
     registry = ContributionRegistry()
     plugin.register(registry)

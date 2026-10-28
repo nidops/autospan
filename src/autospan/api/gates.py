@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from autospan.api.component import _names
 
 _GATE_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -27,7 +28,9 @@ class GateContribution:
             raise ValueError(
                 f"Gate name {self.name!r} must be a lowercase identifier (it becomes a pytest marker)"
             )
-        object.__setattr__(self, "implies", tuple(dict.fromkeys(self.implies)))
+        object.__setattr__(self, "implies", tuple(dict.fromkeys(_names(self.implies, "implies"))))
+        if any(not _GATE_NAME.fullmatch(name) for name in self.implies):
+            raise ValueError(f"Gate {self.name!r} has invalid implied gate names")
         if self.name in self.implies:
             raise ValueError(f"Gate {self.name!r} cannot imply itself")
 

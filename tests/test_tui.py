@@ -249,7 +249,7 @@ def test_ctrl_c_stops_command_without_quitting_and_allows_next_command(focus):
                 if focus == "search":
                     await pilot.press("ctrl+f")
                 elif focus == "palette":
-                    await pilot.press("ctrl+space")
+                    await pilot.press("ctrl+p")
                 await pilot.press("ctrl+c", "ctrl+c")
                 assert await asyncio.to_thread(stopping.wait, 3)
                 assert app.operation_state == "stopping"
@@ -423,14 +423,13 @@ def test_interrupted_emergency_shutdown_keeps_worker_resources(tmp_path, monkeyp
         retry_evidence.close()
 
 
-@pytest.mark.parametrize("key", ["ctrl+p", "ctrl+space", "ctrl+@"])
-def test_command_palette_shortcuts_open_the_picker(key):
+def test_command_palette_shortcut_opens_the_picker():
     from textual.command import CommandPalette
 
     async def scenario():
         app = ConsoleApp(_shell())
         async with app.run_test() as pilot:
-            await pilot.press(key)
+            await pilot.press("ctrl+p")
             assert isinstance(app.screen, CommandPalette)
             await pilot.press("escape")
             assert app.query_one(PromptInput).has_focus

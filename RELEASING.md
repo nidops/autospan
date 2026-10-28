@@ -3,11 +3,8 @@
 Package version lives in `pyproject.toml`; `autospan.__version__` reads installed
 metadata. The plugin API version is separate and is currently `1`.
 
-`0.1.0.post1` updates documentation, synthetic examples, and release metadata
-without changing the runtime API. It is newer than `0.1.0` and satisfies existing
-requirements such as `autospan>=0.1.0` and `autospan>=0.1,<0.2`. Exact pins to
-`autospan==0.1.0` must be updated explicitly. New project plugins retain their own
-initial version, `0.1.0`, independently of the framework release.
+AutoSpan `0.2.0` adds reliability and execution-scope fixes while keeping plugin
+API version 1. Review the changelog and compatibility notes before updating.
 
 ## Setup
 
@@ -24,8 +21,8 @@ reserve the package name. Confirm account ownership and public documentation lin
 2. Run the [development checks](docs/DEVELOPING.md#checks) and
    [distribution checks](docs/DEVELOPING.md#distribution-checks).
 3. From a clean checkout, tag the reviewed `master` commit as `v<version>` after all
-   supported CI jobs pass (for example, `v0.1.0.post1`). Verify the version with
-   `python scripts/check_dist.py dist --tag v0.1.0.post1`, substituting the actual version.
+   supported CI jobs pass (for example, `v0.2.0`). Verify the version with
+   `python scripts/check_dist.py dist --tag v0.2.0`, substituting the actual version.
 4. Push the tag, then manually run **Publish** in GitHub Actions with that tag selected.
 
 The workflow reruns CI, uploads verified artifacts to TestPyPI, checks the downloaded

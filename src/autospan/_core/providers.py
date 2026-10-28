@@ -112,13 +112,38 @@ class ProviderComponentFactory:
             return instance
 
         manager = contribution.factory.open
-        if config.get("lazy"):
-            with ExitStack() as stack:
-                yield LazyProvider(
-                    lambda: check(
-                        stack.enter_context(manager(context, dependencies, config["options"]))
+        with ExitStack() as stack:
+            cleanup_failed: BaseException | None = None
+
+            def acquire() -> object:
+                nonlocal cleanup_failed
+                if cleanup_failed is not None:
+                    raise LifecycleError(
+                        "Lazy provider cleanup failed; cannot retry"
+                    ) from cleanup_failed
+                attempt = ExitStack()
+                try:
+                    instance = attempt.enter_context(
+                        manager(context, dependencies, config["options"])
                     )
-                )
-            return
-        with manager(context, dependencies, config["options"]) as instance:
-            yield check(instance)
+                    check(instance)
+                except BaseException as exc:
+                    try:
+                        # A provider cannot suppress a host contract failure.
+                        attempt.__exit__(type(exc), exc, exc.__traceback__)
+                    except BaseException as cleanup_error:
+                        cleanup_failed = cleanup_error
+                        exc.add_note(f"Provider acquisition cleanup failed: {cleanup_error!r}")
+                    raise
+                stack.enter_context(attempt.pop_all())
+                return instance
+
+            if config.get("lazy"):
+                lazy = LazyProvider(acquire)
+                try:
+                    yield lazy
+                finally:
+                    # Retirement synchronizes with resolve before the stack closes.
+                    lazy._retire()
+            else:
+                yield acquire()

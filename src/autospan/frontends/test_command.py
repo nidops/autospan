@@ -100,10 +100,16 @@ def resolve_scenario_paths(
             raise PluginError(
                 f"Scenario package {contribution.package!r} has ambiguous locations: {locations}"
             )
-        path = Path(locations[0]) / contribution.relative_path
+        package_root = Path(locations[0]).resolve()
+        path = (package_root / contribution.relative_path).resolve()
+        if path != package_root and package_root not in path.parents:
+            raise PluginError(
+                f"Scenario path {contribution.relative_path!r} escapes package "
+                f"{contribution.package!r}"
+            )
         if not path.is_dir():
             raise PluginError(f"Scenario directory does not exist: {path}")
-        result.append(path.resolve())
+        result.append(path)
     return tuple(dict.fromkeys(result))
 
 
@@ -113,37 +119,21 @@ def _rootdir(paths: tuple[Path, ...]) -> Path:
     return common.parent if len(paths) == 1 else common
 
 
-def split_selection(
-    pytest_args: Iterable[str], scenario_paths: tuple[Path, ...], rootdir: Path
-) -> tuple[list[str], list[str]]:
-    """Separate scenario file/node-id selections from the other pytest arguments.
-
-    ``autospan test -- scenarios/node/test_x.py::test_y`` narrows the run the
-    same way plain pytest would. Paths may be given relative to the working
-    directory or to the hosted rootdir (as printed in node ids); only paths
-    inside a contributed scenario directory are treated as selections.
-    """
-
-    selections: list[str] = []
-    rest: list[str] = []
-    for token in pytest_args:
-        if token.startswith("-"):
-            rest.append(token)
-            continue
+def resolve_selections(
+    selections: Iterable[str], scenario_paths: tuple[Path, ...], rootdir: Path
+) -> list[str]:
+    """Resolve pytest-parsed positional arguments within contributed scenarios."""
+    result = []
+    for token in selections:
         base, sep, node = token.partition("::")
         for candidate in (Path(base), rootdir / base):
-            try:
-                resolved = candidate.resolve()
-            except OSError:
-                continue
-            if resolved.exists() and any(
-                resolved == root or root in resolved.parents for root in scenario_paths
-            ):
-                selections.append(str(resolved) + sep + node)
+            resolved = candidate.resolve()
+            if resolved.exists() and any(resolved.is_relative_to(root) for root in scenario_paths):
+                result.append(str(resolved) + sep + node)
                 break
         else:
-            rest.append(token)
-    return selections, rest
+            raise PluginError(f"Test selection {token!r} is outside contributed scenarios")
+    return result or [str(path) for path in scenario_paths]
 
 
 def run_tests(
@@ -163,11 +153,17 @@ def run_tests(
         )
 
     evidence = LocalEvidenceStore(evidence_root)
-    bridge = AutoSpanPytestBridge(host, evidence)
+    ini = evidence.root / "pytest.ini"
+    bridge = AutoSpanPytestBridge(
+        host,
+        evidence,
+        scenario_paths=scenario_paths,
+        hosted_ini=ini,
+        hosted_root=_rootdir(scenario_paths),
+    )
     exit_code = 1
     error: BaseException | None = None
     try:
-        ini = evidence.root / "pytest.ini"
         # The cache lives beside the evidence runs so `--lf`/`--ff` work across runs.
         cache_dir = (Path(evidence_root) / ".pytest_cache").resolve().as_posix()
         ini.write_text(
@@ -181,14 +177,15 @@ def run_tests(
         ]
         for plugin in hosted_pytest_plugins(host.config):
             args.extend(["-p", plugin])
-        selections, rest = split_selection(pytest_args, scenario_paths, _rootdir(scenario_paths))
-        args.extend(selections or [str(path) for path in scenario_paths])
-        args.extend(rest)
+        args.extend(pytest_args)
         evidence.event("pytest_invoked", args=args)
         previous_autoload = os.environ.get("PYTEST_DISABLE_PLUGIN_AUTOLOAD")
         os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
         try:
             exit_code = int(pytest.main(args, plugins=[bridge]))
+            # A later pytest hook may change the exit status after accounting.
+            if exit_code == 0 and bridge.required_gate_failures:
+                exit_code = 1
         finally:
             if previous_autoload is None:
                 os.environ.pop("PYTEST_DISABLE_PLUGIN_AUTOLOAD", None)

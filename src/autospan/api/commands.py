@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shlex
 import threading
 from collections.abc import Callable, Sequence
@@ -68,6 +69,9 @@ class CommandContribution:
     help: str = ""
     usage: str = ""
     complete: ArgumentCompleter | None = None
+    # None keeps conservative legacy diagnostics; () explicitly declares all public.
+    # Explicit sensitive positions also mask handler writes, not arbitrary plugin I/O.
+    sensitive_args: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.path or any(
@@ -76,6 +80,11 @@ class CommandContribution:
             raise ValueError("Command path must contain non-empty tokens without whitespace")
         if self.path[0] in _BUILTINS:
             raise ValueError(f"Reserved console command root: {self.path[0]}")
+        if self.sensitive_args is not None:
+            indices = tuple(self.sensitive_args)
+            if any(type(index) is not int or index < 0 for index in indices):
+                raise ValueError("sensitive_args must contain nonnegative argument indices")
+            object.__setattr__(self, "sensitive_args", tuple(dict.fromkeys(indices)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,14 +168,25 @@ def _tokens(line: str, *, incomplete: bool = False) -> list[_Token]:
     return result
 
 
-def _sanitized(error: BaseException, args: tuple[str, ...]) -> str:
-    """Replace exact arguments, not arbitrary secrets or transformed values."""
-    text = str(error)
-    values = {arg for arg in args if arg}
-    values.update(arg.partition("=")[2] for arg in args if "=" in arg and arg.partition("=")[2])
-    for value in sorted(values, key=len, reverse=True):
-        text = text.replace(value, "<redacted>")
-    return f"{type(error).__name__}: {text}"[:4096]
+def _redacted(text: str, args: tuple[str, ...], sensitive: tuple[int, ...] | None) -> str:
+    selected = args if sensitive is None else tuple(args[i] for i in sensitive if i < len(args))
+    values = {arg for arg in selected if arg}
+    values.update(arg.partition("=")[2] for arg in selected if "=" in arg and arg.partition("=")[2])
+    patterns = []
+    for value in sorted(values, key=lambda item: (-len(item), item)):
+        pattern = re.escape(value)
+        # A numeric argument must not rewrite digits inside another value.
+        if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", value):
+            pattern = r"(?<![\w.])" + pattern + r"(?![\w.])"
+        patterns.append(pattern)
+    return re.sub("|".join(patterns), "<redacted>", text) if patterns else text
+
+
+def _sanitized(
+    error: BaseException, args: tuple[str, ...], sensitive: tuple[int, ...] | None = None
+) -> str:
+    """Mask declared values; never serialize the original exception or traceback."""
+    return f"{type(error).__name__}: {_redacted(str(error), args, sensitive)}"[:4096]
 
 
 class CommandShell:
@@ -311,7 +331,7 @@ class CommandShell:
                     try:
                         names.update(command.complete(self._runtime, typed[len(path) :]))
                     except Exception as exc:
-                        diagnostic = f"completion failed: {_sanitized(exc, typed[len(path) :])}"
+                        diagnostic = f"completion failed: {_sanitized(exc, typed[len(path) :], command.sensitive_args)}"
         finally:
             if available:
                 self._flight.release()
@@ -378,6 +398,14 @@ class CommandShell:
         verdict = StepVerdict()
         error: BaseException | None = None
         diagnostic = ""
+
+        def handler_write(text: str) -> None:
+            write(
+                _redacted(text, args, command.sensitive_args)
+                if command.sensitive_args is not None
+                else text
+            )
+
         step = getattr(self._runtime.evidence, "step", None)
         try:
             scope = (
@@ -387,7 +415,7 @@ class CommandShell:
             )
             with scope:
                 try:
-                    context = CommandContext(self._runtime, write, self._cancel)
+                    context = CommandContext(self._runtime, handler_write, self._cancel)
                     verdict.status = int(command.handler(context, args) or 0)
                 except (CommandCancelled, KeyboardInterrupt) as exc:
                     error = exc
@@ -398,23 +426,25 @@ class CommandShell:
                     verdict.status = 2
                     expected = isinstance(exc, (AutoSpanError, ValueError, TypeError, KeyError))
                     prefix = "command error" if expected else "command failed"
-                    diagnostic = f"{prefix}: {_sanitized(exc, args)}"
+                    diagnostic = f"{prefix}: {_sanitized(exc, args, command.sensitive_args)}"
                     if expected and command.usage:
                         diagnostic += f"\nusage: {' '.join(command.path)} {command.usage}"
                 if error is not None:
-                    verdict.error = _sanitized(error, args)
+                    verdict.error = _sanitized(error, args, command.sensitive_args)
                 if verdict.status and not diagnostic:
                     diagnostic = f"command returned status {verdict.status}"
                 if diagnostic:
                     write(diagnostic + "\n")
         except Exception as exc:
             if error is not None:
-                error.add_note(f"Command evidence failed: {_sanitized(exc, args)}")
+                error.add_note(
+                    f"Command evidence failed: {_sanitized(exc, args, command.sensitive_args)}"
+                )
             else:
                 error = exc
             verdict.status = max(verdict.status, 2)
             diagnostic += (
                 "\n" if diagnostic else ""
-            ) + f"command evidence failed: {_sanitized(exc, args)}"
+            ) + f"command evidence failed: {_sanitized(exc, args, command.sensitive_args)}"
             write(diagnostic + "\n")
         return CommandOutcome(verdict.status, diagnostic=diagnostic, error=error)

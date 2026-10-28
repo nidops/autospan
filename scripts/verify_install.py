@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -13,12 +14,38 @@ import tempfile
 import time
 import venv
 from email.parser import BytesParser
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from zipfile import ZipFile
 
 
 def run(args: list[str], cwd: Path, env: dict[str, str]) -> None:
     subprocess.run(args, cwd=cwd, env=env, check=True)
+
+
+def extract_source(archive: tarfile.TarFile, destination: Path) -> None:
+    """Extract regular source files on every supported Python 3.11 patch level."""
+    members = archive.getmembers()
+    for member in members:
+        path = PurePosixPath(member.name)
+        if (
+            not (member.isfile() or member.isdir())
+            or path.is_absolute()
+            or ".." in path.parts
+            or "\\" in member.name
+            or PureWindowsPath(member.name).drive
+        ):
+            raise ValueError(f"Unsafe source archive member: {member.name!r}")
+    for member in members:
+        target = destination.joinpath(*PurePosixPath(member.name).parts)
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError(f"Missing source archive data: {member.name!r}")
+            with source, target.open("xb") as output:
+                shutil.copyfileobj(source, output)
 
 
 def main() -> None:
@@ -59,7 +86,7 @@ def main() -> None:
         run([*pip, "install", "--upgrade", "pip"], root, env)
 
         with tarfile.open(sdist, "r:gz") as archive:
-            archive.extractall(root / "source", filter="data")
+            extract_source(archive, root / "source")
         (source,) = (root / "source").iterdir()
         distribution = wheel if args.distribution == "wheel" else sdist
         if args.index_url:
@@ -144,7 +171,15 @@ def main() -> None:
             env,
         )
         generated = plugin_root / "autospan-release-smoke"
-        run([*pip, "install", "--no-cache-dir", "-e", f"{generated}[dev]"], root, env)
+        constraint = root / "core-constraint.txt"
+        constraint.write_text(f"autospan=={version}\n", encoding="utf-8")
+        run(
+            [*pip, "install", "--no-cache-dir", "-c", str(constraint), "-e", f"{generated}[dev]"],
+            root,
+            env,
+        )
+        run([*pip, "check"], root, env)
+        run([str(python), "-I", "-c", smoke], root, env)
         config = generated / "autospan.yaml"
         run([str(python), "-I", "-m", "autospan", "plan", "--config", str(config)], root, env)
         run(

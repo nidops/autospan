@@ -249,6 +249,29 @@ Rules:
 - provider packages should run the matching conformance helper from `autospan.testing.conformance`;
 - a new contract belongs in the kernel only when framework-level substitution is genuinely needed and the contract can stay vendor/project neutral.
 
+## Runtime API reference
+
+Import contracts from `autospan.api`; `_core` remains internal.
+
+| Contract | Operations and lifetime |
+| --- | --- |
+| `Runtime` | `get`, `require`, `names`, `items`, `periodic`, `handover`; usable only in its owning activation. `evidence` remains available for diagnostics. |
+| `ComponentContext` | Factory access to `evidence`, `periodic`, `outcome` and `handover`; no second component owner. |
+| `ComponentSpec` | Immutable name, type, dependencies, claims, config and gates. |
+| `ResourceClaim` | Canonical key with shared or exclusive process-local ownership. |
+| `ResourceYield` | `release()` and idempotent `reacquire()` for cooperative handover; recovery is attempted even when release raises. |
+| `LazyProvider` | `resolve()` acquires once; `opened` reports live resolution; teardown retires it. |
+| `Contract`, `ProviderContribution` | Named/versioned runtime protocol and context-managed implementation; shape validation does not prove driver behavior. |
+| `CommandContext` | `runtime`, `write`, `cancel_requested`, `wait`, `check_cancelled`; see the console contract for output privacy. |
+| `Evidence` | `event`, `step`, `scope`, `bind_context`, `reserve_artifact`, `attach_file`; see the evidence guide for correlation and finalization. |
+
+Before `with runtime.handover(key):`, stop conflicting work. Holders release in
+reverse dependency order and recover in dependency order. A recovery failure
+makes managed runtime access fail and forces failed teardown even if the caller
+catches the handover error. Cleanup still runs. Close that activation before
+opening a new one; old views and pending handovers cannot access the new graph.
+Python cannot revoke raw driver references already returned to callers.
+
 ## Compatibility
 
 Project plugins target `AUTOSPAN_PLUGIN_API_VERSION`. AutoSpan refuses incompatible project-plugin API versions before planning/runtime startup.

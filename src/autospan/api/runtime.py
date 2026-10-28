@@ -26,11 +26,17 @@ class Runtime:
         handover: Callable[[str], AbstractContextManager[None]] | None = None,
         *,
         periodic: PeriodicScheduler | None = None,
+        check_usable: Callable[[], None] | None = None,
     ) -> None:
         self._instances = instances
         self._evidence = evidence
         self._periodic = periodic
         self._handover = handover
+        self._check_usable = check_usable
+
+    def _ensure_usable(self) -> None:
+        if self._check_usable is not None:
+            self._check_usable()
 
     @property
     def evidence(self) -> Evidence:
@@ -40,12 +46,14 @@ class Runtime:
     @property
     def periodic(self) -> PeriodicScheduler:
         """Runtime-owned scheduler shared by components and frontends."""
+        self._ensure_usable()
         if self._periodic is None:
             raise LookupError("This Runtime view is not attached to a periodic scheduler")
         return self._periodic
 
     def get(self, name: str) -> object:
         """Return a named component or raise an informative ``KeyError``."""
+        self._ensure_usable()
         try:
             return self._instances[name]
         except KeyError as exc:
@@ -72,14 +80,17 @@ class Runtime:
         Other live runtimes claiming the key must close first; new claims are
         blocked until reacquisition finishes. Reservations are process-local.
         """
+        self._ensure_usable()
         if self._handover is None:
             raise LookupError("This runtime does not support resource handover")
         return self._handover(resource_key)
 
     def names(self) -> tuple[str, ...]:
         """Return all live component names in deterministic order."""
+        self._ensure_usable()
         return tuple(sorted(self._instances))
 
     def items(self) -> Iterator[tuple[str, object]]:
         """Iterate over live component name/object pairs."""
-        return iter(self._instances.items())
+        self._ensure_usable()
+        return iter(tuple(self._instances.items()))

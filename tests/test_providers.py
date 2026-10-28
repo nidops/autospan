@@ -137,7 +137,9 @@ def test_provider_must_satisfy_its_contract(tmp_path: Path) -> None:
 
 
 def test_conformance_helper_accepts_kernel_fake(tmp_path: Path) -> None:
-    result = check_flasher(FakeFlasher(), tmp_path / "image.bin")
+    result = check_flasher(
+        FakeFlasher(), FlashRequest(artifact=tmp_path / "image.bin"), allow_flash=True
+    )
     assert result.ok
 
 

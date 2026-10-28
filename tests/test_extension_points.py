@@ -402,19 +402,18 @@ def test_hosted_run_writes_deterministic_ini(
 def test_node_id_selection_narrows_the_hosted_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from autospan.frontends.test_command import split_selection
+    from autospan.frontends.test_command import resolve_selections
 
     host, _ = _scenario_host(tmp_path, monkeypatch)
     (contribution,) = host.plan.scenarios
     root = tmp_path / "pkgroot" / contribution.package
     test_file = next(root.glob("test_*.py"))
-    selections, rest = split_selection(
-        ("-k", "x", f"{contribution.package}/{test_file.name}::test_plain", "missing.py", "-q"),
-        (root.resolve(),),
-        root.parent,
+    selections = resolve_selections(
+        (f"{contribution.package}/{test_file.name}::test_plain",), (root.resolve(),), root.parent
     )
     assert selections == [f"{test_file.resolve()}::test_plain"]
-    assert rest == ["-k", "x", "missing.py", "-q"]
+    with pytest.raises(PluginError, match="outside contributed"):
+        resolve_selections(("missing.py",), (root.resolve(),), root.parent)
 
     code = run_tests(
         host=host,
@@ -639,7 +638,9 @@ def test_cli_run_unknown_frontend_is_a_clean_error(
     config = tmp_path / "autospan.yaml"
     config.write_text("autospan:\n  plugins: []\n", encoding="utf-8")
     assert cli_main(["run", "nope.tool", "--config", str(config), "--", "--flag"]) == 2
-    assert "Unknown frontend 'nope.tool'" in capsys.readouterr().out
+    output = capsys.readouterr()
+    assert "Unknown frontend 'nope.tool'" in output.err
+    assert output.out == ""
 
 
 # --------------------------------------------------------------------------- testing helpers

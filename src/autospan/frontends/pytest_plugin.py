@@ -7,7 +7,8 @@ from typing import Any, Iterator
 
 import pytest
 
-from autospan.api.errors import GateError, LifecycleError
+from autospan.api.errors import GateError, LifecycleError, PluginError
+from autospan.api.component import RESERVED_PYTEST_INI_KEYS
 from autospan.api.runtime import Runtime
 from autospan._core.evidence_store import LocalEvidenceStore
 from autospan._core.host import HostBuild
@@ -31,13 +32,32 @@ def _node_outcome(node: Any) -> str | None:
 class AutoSpanPytestBridge:
     """Pytest owns test execution; AutoSpan owns runtime/evidence lifecycle and gates."""
 
-    def __init__(self, host: HostBuild, evidence: LocalEvidenceStore) -> None:
+    def __init__(
+        self,
+        host: HostBuild,
+        evidence: LocalEvidenceStore,
+        *,
+        scenario_paths: tuple[Path, ...] | None = None,
+        hosted_ini: Path | None = None,
+        hosted_root: Path | None = None,
+    ) -> None:
+        self._hosted_ini = hosted_ini
+        self._hosted_root = hosted_root
         self._host = host
+        self._scenario_paths = scenario_paths
         self._evidence = evidence
         self._enabled: frozenset[str] = frozenset()
         self._session_failed = False
         self._session_has_pass = False
         self._session_owner: RuntimeSession | None = None
+        self._required: tuple[str, ...] = ()
+        self._missing_required: tuple[str, ...] = ()
+        self._test_gates: dict[str, set[str]] = {}
+        self._coverage_reports: dict[str, dict[str, pytest.TestReport]] = {}
+
+    @property
+    def required_gate_failures(self) -> tuple[str, ...]:
+        return self._missing_required
 
     @property
     def enabled_gates(self) -> frozenset[str]:
@@ -45,6 +65,13 @@ class AutoSpanPytestBridge:
 
     def pytest_addoption(self, parser: pytest.Parser) -> None:
         group = parser.getgroup("autospan")
+        group.addoption(
+            "--require-gate",
+            action="append",
+            default=[],
+            metavar="NAME",
+            help="require at least one fully passing test for this gate (repeatable; does not authorize hardware)",
+        )
         for gate in self._host.gates:
             implied = self._host.gate_closure(gate.name)[1:]
             suffix = f" (also requires {', '.join('--' + g for g in implied)})" if implied else ""
@@ -56,7 +83,65 @@ class AutoSpanPytestBridge:
                 help=(gate.help or f"allow tests marked {gate.name}") + suffix,
             )
 
+    def _hosted_selections(self, config: pytest.Config, options: Any) -> list[str]:
+        from autospan.frontends.test_command import resolve_selections
+
+        if self._hosted_ini is None or self._hosted_root is None:
+            return []
+        if (
+            config.inipath is None
+            or config.inipath.resolve() != self._hosted_ini.resolve()
+            or config.rootpath.resolve() != self._hosted_root.resolve()
+            or Path(options.inifilename).resolve() != self._hosted_ini.resolve()
+            or options.pyargs
+            or (
+                options.confcutdir is not None
+                and Path(options.confcutdir).resolve() != self._hosted_ini.parent.resolve()
+            )
+            or (
+                options.rootdir is not None and Path(options.rootdir).resolve() != self._hosted_root
+            )
+        ):
+            raise pytest.UsageError("Hosted pytest options override execution boundaries")
+        for override in options.override_ini or ():
+            key = override.split("=", 1)[0].strip()
+            if key in RESERVED_PYTEST_INI_KEYS | {"addopts"}:
+                raise pytest.UsageError(f"Hosted pytest ini {key!r} is owned by AutoSpan")
+        try:
+            return resolve_selections(
+                options.file_or_dir, self._scenario_paths or (), self._hosted_root
+            )
+        except PluginError as exc:
+            raise pytest.UsageError(str(exc)) from exc
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_load_initial_conftests(self, early_config: pytest.Config) -> None:
+        if self._hosted_ini is not None:
+            # Pytest has parsed option values, including plugin options and @files.
+            # Validate before initial conftest imports or test collection.
+            options = early_config.known_args_namespace
+            options.file_or_dir = self._hosted_selections(early_config, options)
+
     def pytest_configure(self, config: pytest.Config) -> None:
+        if self._hosted_ini is not None:
+            config.args = self._hosted_selections(config, config.option)
+        self._required = tuple(dict.fromkeys(config.getoption("require_gate")))
+        self._missing_required = self._required
+        known = {gate.name for gate in self._host.gates}
+        unknown = set(self._required) - known
+        if unknown:
+            raise pytest.UsageError(
+                f"Unknown required AutoSpan gate(s): {', '.join(sorted(unknown))}"
+            )
+        if self._required and (
+            getattr(config.option, "numprocesses", None) not in (None, 0, "0")
+            or getattr(config.option, "tx", None)
+            or getattr(config.option, "dist", "no") != "no"
+            or hasattr(config, "workerinput")
+        ):
+            raise pytest.UsageError(
+                "--require-gate does not support xdist; use a serial verification job"
+            )
         for gate in self._host.gates:
             config.addinivalue_line("markers", f"{gate.name}: {gate.help or 'AutoSpan gate'}")
         requested = frozenset(
@@ -68,11 +153,38 @@ class AutoSpanPytestBridge:
             name for name in requested if requested.issuperset(self._host.gate_closure(name))
         )
         self._evidence.event("gates_configured", enabled=sorted(self._enabled))
+        missing = sorted(set(self._required) - self._enabled)
+        if missing:
+            raise pytest.UsageError(
+                "Required AutoSpan gate(s) not authorized: "
+                + ", ".join(missing)
+                + "; enable their gate flags and implied gates explicitly"
+            )
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_ignore_collect(self, collection_path: Path) -> None:
+        if (
+            self._scenario_paths is not None
+            and any(collection_path.is_relative_to(root) for root in self._scenario_paths)
+            and not any(
+                collection_path.resolve().is_relative_to(root) for root in self._scenario_paths
+            )
+        ):
+            raise pytest.UsageError(
+                f"Collection path {collection_path} is outside contributed scenarios"
+            )
 
     def pytest_collection_modifyitems(
         self, config: pytest.Config, items: list[pytest.Item]
     ) -> None:
         del config
+        if self._scenario_paths is not None:
+            for item in items:
+                path = Path(str(item.path)).resolve()
+                if not any(path == root or root in path.parents for root in self._scenario_paths):
+                    raise pytest.UsageError(
+                        f"Collected test {item.nodeid!r} is outside contributed scenarios"
+                    )
         for item in items:
             required: list[str] = []
             for gate in self._host.gates:
@@ -92,6 +204,18 @@ class AutoSpanPytestBridge:
                     missing[-1],
                 )
                 item.add_marker(pytest.mark.skip(reason=f"requires --{basic.replace('_', '-')}"))
+            qualifying = set(required)
+            if {"runtime", "session_runtime"}.intersection(getattr(item, "fixturenames", ())):
+                qualifying.update(self._component_gates())
+            self._test_gates[item.nodeid] = qualifying
+
+    def _component_gates(self) -> set[str]:
+        return {
+            name
+            for spec in self._host.plan.components
+            for gate in spec.gates
+            for name in self._host.gate_closure(gate)
+        }
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_makereport(
@@ -108,6 +232,7 @@ class AutoSpanPytestBridge:
 
     @pytest.fixture
     def runtime(self, request: pytest.FixtureRequest) -> Iterator[Runtime]:
+        self._test_gates.setdefault(request.node.nodeid, set()).update(self._component_gates())
         session = RuntimeSession(
             plan=self._host.plan,
             factories=self._host.factories,
@@ -162,8 +287,32 @@ class AutoSpanPytestBridge:
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         # The final teardown report arrives after session fixture finalizers.
         # Waiting for sessionfinish lets components retain evidence for that failure.
+        if self._required:
+            counts = {gate: 0 for gate in self._required}
+            for nodeid, reports in self._coverage_reports.items():
+                if all(
+                    phase in reports
+                    and reports[phase].passed
+                    and not hasattr(reports[phase], "wasxfail")
+                    for phase in ("setup", "call", "teardown")
+                ):
+                    for gate in self._test_gates.get(nodeid, set()).intersection(counts):
+                        counts[gate] += 1
+            missing = [gate for gate, count in counts.items() if count == 0]
+            self._missing_required = tuple(missing)
+            self._evidence.event("required_gates_checked", passed=counts, missing=missing)
+            if missing:
+                # Do not mask collection errors, interrupts or pytest's no-tests code.
+                if session.exitstatus == pytest.ExitCode.OK:
+                    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+                reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+                if reporter is not None:
+                    reporter.write_sep(
+                        "=", "Required gate coverage missing: " + ", ".join(missing), red=True
+                    )
+
         try:
-            self.close_session_runtime(exitstatus)
+            self.close_session_runtime(int(session.exitstatus))
         except LifecycleError as exc:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
             reporter = session.config.pluginmanager.get_plugin("terminalreporter")
@@ -196,6 +345,8 @@ class AutoSpanPytestBridge:
             autospan_evidence.event("test_scope_finished", nodeid=request.node.nodeid)
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if self._required:
+            self._coverage_reports.setdefault(report.nodeid, {})[report.when] = report
         if report.outcome == "failed":
             self._session_failed = True
         if report.when == "call" and report.outcome == "passed":

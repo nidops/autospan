@@ -19,7 +19,7 @@ name = "autospan-__NAME__"
 version = "0.1.0"
 description = "AutoSpan project plugin: __NAME__"
 requires-python = ">=3.11"
-dependencies = ["autospan>=0.1,<0.2"]
+dependencies = ["autospan>=0.2,<0.3"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10"]

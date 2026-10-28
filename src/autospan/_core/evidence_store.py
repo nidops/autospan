@@ -12,7 +12,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from threading import RLock
 from typing import Any, Iterator, Mapping
 
@@ -42,7 +42,17 @@ class LocalEvidenceStore:
     """
 
     def __init__(self, root: Path, *, run_id: str | None = None) -> None:
-        self.run_id = run_id or _make_run_id()
+        self.run_id = _make_run_id() if run_id is None else run_id
+        if (
+            not isinstance(self.run_id, str)
+            or self.run_id in {".", ".."}
+            or not self.run_id
+            or "/" in self.run_id
+            or "\\" in self.run_id
+            or PureWindowsPath(self.run_id).drive
+            or _safe_token(self.run_id) != self.run_id
+        ):
+            raise ValueError("run_id must be a single non-empty directory name")
         self.root = root / self.run_id
         self.root.mkdir(parents=True, exist_ok=False)
         self._events_path = self.root / "events.jsonl"
@@ -52,6 +62,11 @@ class LocalEvidenceStore:
         self._reserved_paths: set[Path] = set()
         self._lock = RLock()
         self._closed = False
+        self._write_error: BaseException | None = None
+        self._finished = False
+        self._pending_manifest: str | None = None
+        self._step_sequence = 0
+        self._event_sequence = 0
         self._context: contextvars.ContextVar[EvidenceContext] = contextvars.ContextVar(
             "autospan_evidence_context",
             default=EvidenceContext(run_id=self.run_id),
@@ -73,11 +88,17 @@ class LocalEvidenceStore:
     ) -> Iterator[EvidenceContext]:
         """Temporarily derive and bind a test/step evidence context."""
         parent = self.current_context
+        same_step = (test_id is None or test_id == parent.test_id) and (
+            step_id is None or step_id == parent.step_id
+        )
         context = EvidenceContext(
             run_id=self.run_id,
             test_id=test_id if test_id is not None else parent.test_id,
             step_id=step_id if step_id is not None else parent.step_id,
             source=source,
+            step_uid=parent.step_uid if same_step else None,
+            parent_step_uid=parent.parent_step_uid if same_step else None,
+            step_sequence=parent.step_sequence if same_step else None,
         )
         with self.bind_context(context):
             yield context
@@ -103,7 +124,23 @@ class LocalEvidenceStore:
         label = str(name).strip()
         if not label:
             raise ValueError("Evidence step name must not be empty")
-        with self.scope(step_id=label, source=source) as context:
+        parent = self.current_context
+        with self._lock:
+            if self._closed or self._finished:
+                raise RuntimeError("Evidence store is closed")
+            self._step_sequence += 1
+            sequence = self._step_sequence
+        context = EvidenceContext(
+            run_id=self.run_id,
+            test_id=parent.test_id,
+            step_id=label,
+            source=source,
+            step_uid=f"step-{sequence:08d}",
+            parent_step_uid=parent.step_uid,
+            step_sequence=sequence,
+        )
+        started = time.monotonic()
+        with self.bind_context(context):
             self.event("step_started", source=source, step=label)
             try:
                 yield context
@@ -114,6 +151,7 @@ class LocalEvidenceStore:
                         source=source,
                         step=label,
                         outcome="failed",
+                        duration_s=time.monotonic() - started,
                         error=repr(exc),
                     )
                 except BaseException as reporting_error:
@@ -130,6 +168,7 @@ class LocalEvidenceStore:
                     source=source,
                     step=label,
                     outcome=verdict.outcome if verdict is not None else "passed",
+                    duration_s=time.monotonic() - started,
                     **attributes,
                 )
 
@@ -138,20 +177,38 @@ class LocalEvidenceStore:
         context = self.current_context
         now = datetime.now(timezone.utc).isoformat()
         payload = {
+            "schema_version": 2,
             "name": name,
             "wall_time": now,
             "monotonic_ns": time.monotonic_ns(),
             "run_id": context.run_id,
             "test_id": context.test_id,
             "step_id": context.step_id,
+            "step_uid": context.step_uid,
+            "parent_step_uid": context.parent_step_uid,
+            "step_sequence": context.step_sequence,
             "source": source,
             "attributes": attributes,
         }
         with self._lock:
-            if self._closed:
+            if self._closed or self._finished:
                 raise RuntimeError("Evidence store is closed")
-            self._events_file.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
-            self._events_file.flush()
+            payload["sequence"] = self._event_sequence + 1
+            serialized = json.dumps(payload, sort_keys=True, default=str) + "\n"
+            position = self._events_file.tell()
+            try:
+                self._events_file.write(serialized)
+                self._events_file.flush()
+            except BaseException as exc:
+                try:
+                    self._events_file.seek(position)
+                    self._events_file.truncate()
+                except BaseException as rollback_error:
+                    self._write_error = rollback_error
+                    self._closed = True
+                    exc.add_note(f"Event rollback failed; store is unusable: {rollback_error!r}")
+                raise
+            self._event_sequence += 1
 
     @contextmanager
     def reserve_artifact(
@@ -182,7 +239,7 @@ class LocalEvidenceStore:
         # this reservation set, two worker threads can both observe that the
         # same readable name does not exist yet and select one partial path.
         with self._lock:
-            if self._closed:
+            if self._closed or self._finished:
                 raise RuntimeError("Evidence store is closed")
             final_name = f"{safe_source}-{readable_name}{suffix}"
             final_path = scope_dir / final_name
@@ -271,6 +328,10 @@ class LocalEvidenceStore:
     def close(self, *, outcome: str = "unknown", metadata: Mapping[str, Any] | None = None) -> None:
         """Finalize events and atomically publish the run manifest."""
         with self._lock:
+            if self._write_error is not None:
+                raise RuntimeError(
+                    "Evidence event stream could not be repaired"
+                ) from self._write_error
             if self._closed:
                 return
             if self._reserved_paths:
@@ -278,19 +339,26 @@ class LocalEvidenceStore:
                     "Evidence store cannot close with active artifact reservation(s): "
                     f"{len(self._reserved_paths)}"
                 )
-            self.event("run_finished", outcome=outcome)
-            self._events_file.close()
-            manifest = {
-                "run_id": self.run_id,
-                "outcome": outcome,
-                "metadata": dict(metadata or {}),
-                "artifacts": [_artifact_to_json(item, self.root) for item in self._artifacts],
-            }
+            if self._pending_manifest is None:
+                manifest = {
+                    "schema_version": 2,
+                    "run_id": self.run_id,
+                    "outcome": outcome,
+                    "metadata": dict(metadata or {}),
+                    "artifacts": [_artifact_to_json(item, self.root) for item in self._artifacts],
+                }
+                # Invalid metadata leaves the run open. Once staged, retries publish
+                # the same verdict and snapshot, even if a caller supplies new values.
+                serialized = json.dumps(manifest, indent=2, sort_keys=True, default=str)
+            else:
+                serialized = self._pending_manifest
             temp = self._manifest_path.with_suffix(".json.tmp")
-            temp.write_text(
-                json.dumps(manifest, indent=2, sort_keys=True, default=str),
-                encoding="utf-8",
-            )
+            temp.write_text(serialized, encoding="utf-8")
+            if not self._finished:
+                self.event("run_finished", outcome=json.loads(serialized)["outcome"])
+                self._finished = True
+                self._pending_manifest = serialized
+            self._events_file.close()
             os.replace(temp, self._manifest_path)
             self._closed = True
 
@@ -300,12 +368,15 @@ class LocalEvidenceStore:
             return tuple(self._artifacts)
 
     def _scope_dir(self, context: EvidenceContext) -> Path:
-        if context.test_id is None:
-            return self.root / "session"
-        test_dir = self.root / "tests" / _safe_token(context.test_id)
-        if context.step_id is None:
+        test_dir = (
+            self.root / "session"
+            if context.test_id is None
+            else self.root / "tests" / _safe_token(context.test_id)
+        )
+        identity = context.step_uid or context.step_id
+        if identity is None:
             return test_dir
-        return test_dir / "steps" / _safe_token(context.step_id)
+        return test_dir / "steps" / _safe_token(identity)
 
     def _commit_reservation(self, reservation: _Reservation, *, complete: bool) -> Artifact:
         digest = hashlib.sha256()
@@ -359,6 +430,14 @@ def _validated_suffix(value: str) -> str:
         raise ValueError("Evidence artifact suffix must not contain path separators")
     if not suffix.startswith("."):
         raise ValueError("Evidence artifact suffix must be empty or start with '.'")
+    if (
+        suffix.endswith(".")
+        or len(suffix) > 32
+        or any(not (ch.isascii() and (ch.isalnum() or ch in "._-")) for ch in suffix)
+    ):
+        raise ValueError(
+            "Evidence artifact suffix must be a portable extension of at most 32 characters"
+        )
     if suffix in {".", ".."}:
         raise ValueError("Evidence artifact suffix must include a file extension")
     return suffix
@@ -366,7 +445,7 @@ def _validated_suffix(value: str) -> str:
 
 def _artifact_to_json(artifact: Artifact, root: Path) -> dict[str, Any]:
     payload = asdict(artifact)
-    payload["path"] = str(artifact.path.relative_to(root))
+    payload["path"] = artifact.path.relative_to(root).as_posix()
     payload["context"] = asdict(artifact.context)
     return payload
 
@@ -377,6 +456,21 @@ def _make_run_id() -> str:
 
 
 def _safe_token(value: str) -> str:
-    chars = [ch if ch.isalnum() or ch in "-_." else "_" for ch in value]
+    chars = [ch if ch.isascii() and (ch.isalnum() or ch in "-_.") else "_" for ch in value]
     token = "".join(chars).strip("._")
-    return token[:180] or "unnamed"
+    # Hash altered/truncated names to avoid both collisions and UTF-8 byte limits.
+    reserved = token.split(".", 1)[0].upper() in {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "CONIN$",
+        "CONOUT$",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+    if reserved:
+        token = "item-" + token
+    if token != value or len(token) > 80 or not token:
+        return (token[:80] or "unnamed") + "-" + hashlib.sha256(value.encode()).hexdigest()[:16]
+    return token

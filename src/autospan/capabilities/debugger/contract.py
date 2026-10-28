@@ -62,6 +62,7 @@ class DebuggerSnapshot:
     symbols: dict[str, bytes] = field(default_factory=dict)
 
     def diff(self, newer: "DebuggerSnapshot") -> DebuggerSnapshotDiff:
+        """Compare state and entries, using ``"<missing>"`` for absent keys."""
         return DebuggerSnapshotDiff(
             state=(
                 DebuggerValueChange(self.state, newer.state) if self.state != newer.state else None
@@ -72,6 +73,7 @@ class DebuggerSnapshot:
         )
 
     def to_dict(self) -> dict[str, object]:
+        """Return JSON-compatible data, rendering byte values as hexadecimal."""
         return {
             "state": self.state,
             "variables": {name: _json_value(value) for name, value in self.variables.items()},
@@ -108,7 +110,13 @@ def _json_value(value: object) -> object:
 
 @runtime_checkable
 class DebuggerBreakpointDriver(Protocol):
-    """Provider-side breakpoint handle consumed by the project facade."""
+    """Provider-side breakpoint handle consumed by the project facade.
+
+    ``location`` identifies the breakpoint; ``active`` reports its status.
+    ``wait`` waits for a hit using timeout/poll values in seconds; the provider
+    defines failure behavior. ``remove`` removes the breakpoint. The bundled
+    fake does not simulate hits: its ``wait`` returns immediately.
+    """
 
     @property
     def location(self) -> str: ...
@@ -123,7 +131,21 @@ class DebuggerBreakpointDriver(Protocol):
 
 @runtime_checkable
 class DebuggerDriver(Protocol):
-    """Debugger operations exposed by a provider to the framework facade."""
+    """Provider-owned target control, inspection and debugger commands.
+
+    Use instances only within their owning component scope. Control operations
+    (attach, prepare, run, halt, reset and system_up), expressions, commands and
+    scripts use the provider's target semantics and may change target state.
+    Providers must document their prerequisites and driver exceptions.
+
+    Wait timeouts and polling intervals are seconds. ``wait_until`` repeatedly
+    calls ``reader`` and returns the value satisfying ``predicate``; the named
+    wait helpers observe running/stopped state or an expected expression/value.
+    Memory and symbol lengths are byte counts. ``snapshot`` selects named
+    variables/registers and maps each requested symbol to its byte count; the
+    protocol does not guarantee an atomic observation. Timeout enforcement and
+    supported expressions, registers and script options belong to the provider.
+    """
 
     def attach(self) -> None: ...
     def prepare(self) -> None: ...

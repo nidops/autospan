@@ -1,6 +1,6 @@
 # AutoSpan
 
-Test automation from hardware to CI.
+Python runtime for reproducible hardware testing, resource ownership and evidence.
 
 AutoSpan plans and runs host-side tests with explicit resource ownership, predictable
 cleanup and evidence. Project plugins supply the configuration, drivers, scenarios
@@ -17,7 +17,7 @@ configuration -> project plugin -> runtime plan -> components
 ## Quick start
 
 Python 3.11 or newer is required. The package is `autospan`; use the `test` and
-`tui` extras for pytest and Textual. Install from this checkout and create a small
+`tui` extras for pytest and Textual. Install the published package and create a small
 project with an installed smoke scenario:
 
 These commands use a POSIX shell. On Windows, create the environment with
@@ -26,7 +26,7 @@ These commands use a POSIX shell. On Windows, create the environment with
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[test,tui]'
+python -m pip install 'autospan[test,tui]==0.2.0'
 autospan new sample
 python -m pip install -e './autospan-sample[dev]'
 autospan plan --config autospan-sample/autospan.yaml

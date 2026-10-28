@@ -16,6 +16,10 @@ class EvidenceContext:
     test_id: str | None = None
     step_id: str | None = None
     source: str = "autospan"
+    # step_id retains its legacy label meaning; step_uid is the unique identity.
+    step_uid: str | None = None
+    parent_step_uid: str | None = None
+    step_sequence: int | None = None
 
 
 @dataclass(slots=True)

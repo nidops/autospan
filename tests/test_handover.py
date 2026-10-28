@@ -171,12 +171,13 @@ def test_reacquisition_failure_recording_cannot_skip_other_holders(tmp_path, mon
         original_event(name, **fields)
 
     try:
-        with session as runtime:
-            monkeypatch.setattr(session.evidence, "event", broken_event)
-            with pytest.raises(LifecycleError, match="reacquisition failed"):
-                with runtime.handover("chan:1"):
-                    pass
-            assert log[-2:] == ["reacquire a", "reacquire b"]
+        with pytest.raises(LifecycleError, match="not recovered"):
+            with session as runtime:
+                monkeypatch.setattr(session.evidence, "event", broken_event)
+                with pytest.raises(LifecycleError, match="reacquisition failed"):
+                    with runtime.handover("chan:1"):
+                        pass
+                assert log[-2:] == ["reacquire a", "reacquire b"]
     finally:
         monkeypatch.setattr(session.evidence, "event", original_event)
         session.evidence.close(outcome="failed")
@@ -193,12 +194,13 @@ def test_multiple_reacquisition_failures_retain_secondary_diagnostics(tmp_path):
 
     session = _session(tmp_path, lambda name: Holder(name, log))
     try:
-        with session as runtime:
-            with pytest.raises(LifecycleError) as failure:
-                with runtime.handover("chan:1"):
-                    pass
-            assert failure.value.__cause__ is errors["a"]
-            assert "recovery:b" in " ".join(failure.value.__notes__)
-            assert log[-2:] == ["reacquire a", "reacquire b"]
+        with pytest.raises(LifecycleError, match="not recovered"):
+            with session as runtime:
+                with pytest.raises(LifecycleError) as failure:
+                    with runtime.handover("chan:1"):
+                        pass
+                assert failure.value.__cause__ is errors["a"]
+                assert "recovery:b" in " ".join(failure.value.__notes__)
+                assert log[-2:] == ["reacquire a", "reacquire b"]
     finally:
         session.evidence.close()

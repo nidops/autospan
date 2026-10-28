@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -14,6 +14,19 @@ from typing import Any, Protocol, runtime_checkable
 from autospan.api.periodic import PeriodicScheduler
 
 _GATE_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _names(values: Iterable[str], field: str) -> tuple[str, ...]:
+    """Reject accidental character sequences and ambiguous names."""
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{field} must be a collection of names, not a string; use ('name',)")
+    result = tuple(values)
+    for value in result:
+        if not isinstance(value, str):
+            raise TypeError(f"{field} must contain only strings")
+        if not value or value != value.strip():
+            raise ValueError(f"{field} names must be nonempty and have no surrounding whitespace")
+    return result
 
 
 def _freeze(value: Any) -> Any:
@@ -81,15 +94,14 @@ class ComponentSpec:
     gates: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.name.strip():
-            raise ValueError("ComponentSpec.name must not be empty")
-        if not self.type_id.strip():
-            raise ValueError("ComponentSpec.type_id must not be empty")
+        _names((self.name,), "ComponentSpec.name")
+        _names((self.type_id,), "ComponentSpec.type_id")
+        object.__setattr__(self, "dependencies", _names(self.dependencies, "dependencies"))
         if len(set(self.dependencies)) != len(self.dependencies):
             raise ValueError(f"Component {self.name!r} contains duplicate dependencies")
         object.__setattr__(self, "dependencies", tuple(self.dependencies))
         object.__setattr__(self, "claims", tuple(self.claims))
-        object.__setattr__(self, "gates", tuple(dict.fromkeys(g.strip() for g in self.gates)))
+        object.__setattr__(self, "gates", tuple(dict.fromkeys(_names(self.gates, "gates"))))
         invalid = [gate for gate in self.gates if not _GATE_NAME.fullmatch(gate)]
         if invalid:
             raise ValueError(f"Component {self.name!r} declares invalid gate name(s): {invalid}")

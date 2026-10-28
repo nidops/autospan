@@ -83,17 +83,46 @@ class RuntimeSession:
         self._plan = plan
         self._factories = factories
         self.evidence = evidence
-        self._enabled_gates = None if enabled_gates is None else frozenset(enabled_gates)
+        from autospan.api.component import _names
+
+        self._enabled_gates = (
+            None if enabled_gates is None else frozenset(_names(enabled_gates, "enabled_gates"))
+        )
         self._stack = ExitStack()
         self._runtime: Runtime | None = None
         self._outcome: str | None = None
         self._instances: dict[str, object] = {}
-        self._coordinator = HandoverCoordinator(plan, self._instances, evidence)
+        self._coordinator = HandoverCoordinator(
+            plan, self._instances, evidence, self._recovery_failed
+        )
         self._periodic: RuntimePeriodicScheduler | None = None
         self._claim_owner: object | None = None
         self._lifecycle = Condition()
         self._state: Literal["idle", "opening", "active", "stopping"] = "idle"
         self._handovers: dict[int, int] = {}
+        self._generation = 0
+        self._unhealthy: str | None = None
+
+    def _recovery_failed(self, key: str, errors: list[BaseException]) -> None:
+        """Invalidate runtime views when physical ownership could not be restored."""
+        with self._lifecycle:
+            self._unhealthy = key
+            self._outcome = "failed"
+        self._record_failure("runtime_resource_unavailable", errors[0], resource=key)
+
+    def _assert_usable(self, generation: int) -> None:
+        with self._lifecycle:
+            if generation != self._generation:
+                raise LifecycleError("Runtime view is no longer active")
+            if self._state == "stopping":
+                raise LifecycleError("RuntimeSession is stopping; cannot use runtime")
+            if self._state not in ("opening", "active"):
+                raise LifecycleError("Runtime view is no longer active")
+            if self._unhealthy is not None:
+                raise LifecycleError(
+                    f"Runtime resource {self._unhealthy!r} was not recovered; "
+                    "stop and reopen the runtime before accessing components"
+                )
 
     @property
     def periodic(self) -> RuntimePeriodicScheduler:
@@ -112,14 +141,26 @@ class RuntimeSession:
             raise ValueError(
                 f"Unknown runtime outcome {outcome!r}; expected one of {sorted(OUTCOMES)}"
             )
-        self._outcome = outcome
+        # Loss of physical resource ownership is a terminal session failure.
+        with self._lifecycle:
+            if self._unhealthy is not None:
+                self._outcome = "failed"
+            else:
+                self._outcome = outcome
 
     @contextmanager
-    def handover(self, resource_key: str) -> Iterator[None]:
+    def handover(self, resource_key: str, *, generation: int | None = None) -> Iterator[None]:
         thread = get_ident()
         with self._lifecycle:
+            if generation is not None:
+                self._assert_usable(generation)
             if self._state == "stopping":
                 raise LifecycleError("RuntimeSession is stopping; cannot hand over resources")
+            if self._unhealthy is not None:
+                raise LifecycleError(
+                    f"Runtime resource {self._unhealthy!r} was not recovered; "
+                    "stop the runtime before further handovers"
+                )
             owner = self._claim_owner
             if owner is None or self._periodic is None:
                 raise LifecycleError("RuntimeSession is not active")
@@ -162,6 +203,12 @@ class RuntimeSession:
             if self._state != "idle":
                 raise LifecycleError("RuntimeSession is already active")
             self._state = "opening"
+            self._unhealthy = None
+            self._generation += 1
+            self._instances = {}
+            self._coordinator = HandoverCoordinator(
+                self._plan, self._instances, self.evidence, self._recovery_failed
+            )
         try:
             runtime = self._open()
         except BaseException:
@@ -239,11 +286,13 @@ class RuntimeSession:
                     component=spec.name,
                     type_id=spec.type_id,
                 )
+            generation = self._generation
             self._runtime = Runtime(
                 instances,
                 self.evidence,
-                self.handover,
+                lambda key: self.handover(key, generation=generation),
                 periodic=self.periodic,
+                check_usable=lambda: self._assert_usable(generation),
             )
             self.evidence.event("runtime_started", components=list(self._runtime.names()))
         except BaseException as exc:
@@ -335,6 +384,8 @@ class RuntimeSession:
         if exc is not None:
             for error in cleanup_errors:
                 exc.add_note(f"Runtime cleanup failed: {error!r}")
+            if self._unhealthy is not None:
+                exc.add_note(f"Runtime resource {self._unhealthy!r} was not recovered")
 
         if exc is None and cleanup_errors:
             if len(cleanup_errors) == 1:
@@ -342,4 +393,9 @@ class RuntimeSession:
                 raise LifecycleError(f"Runtime teardown failed: {error}") from error
             details = "; ".join(str(item) for item in cleanup_errors)
             raise LifecycleError(f"Runtime teardown failed: {details}") from cleanup_errors[0]
+        if exc is None and self._unhealthy is not None:
+            raise LifecycleError(
+                f"Runtime resource {self._unhealthy!r} was not recovered; "
+                "the owning session has been closed"
+            )
         return False

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -18,11 +18,18 @@ class HandoverCoordinator:
     reacquisition runs in the opposite order, even when the guarded block fails.
     """
 
-    def __init__(self, plan: RuntimePlan, instances: Mapping[str, object], evidence: Any) -> None:
+    def __init__(
+        self,
+        plan: RuntimePlan,
+        instances: Mapping[str, object],
+        evidence: Any,
+        on_recovery_failure: Callable[[str, list[BaseException]], None] | None = None,
+    ) -> None:
         self._plan = plan
         self._instances = instances
         self._evidence = evidence
         self._active: set[str] = set()
+        self._on_recovery_failure = on_recovery_failure
 
     def _holders(self, key: str) -> list[str]:
         known = {claim.key for spec in self._plan.components for claim in spec.claims}
@@ -85,6 +92,8 @@ class HandoverCoordinator:
         finally:
             try:
                 errors = reacquire_all()
+                if errors and self._on_recovery_failure is not None:
+                    self._on_recovery_failure(key, errors)
                 if body_error is not None:
                     for error in errors:
                         body_error.add_note(f"Resource reacquisition failed: {error!r}")

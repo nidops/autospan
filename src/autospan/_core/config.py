@@ -12,9 +12,56 @@ import yaml
 from autospan.api.errors import ConfigurationError
 
 
+class _StrictLoader(yaml.SafeLoader):
+    """Reject duplicate explicit keys before applying YAML merge precedence."""
+
+    def __init__(self, stream: Any) -> None:
+        super().__init__(stream)
+        self._checked: set[int] = set()
+        self._flattening: set[int] = set()
+
+    def flatten_mapping(self, node: Any) -> None:
+        identity = id(node)
+        if identity in self._flattening:
+            raise yaml.constructor.ConstructorError(
+                None, None, "recursive YAML merge", node.start_mark
+            )
+        if identity not in self._checked:
+            seen: set[Any] = set()
+            merge_key = object()
+            for key_node, _ in node.value:
+                key = (
+                    merge_key
+                    if key_node.tag == "tag:yaml.org,2002:merge"
+                    else key_node.value
+                    if key_node.tag == "tag:yaml.org,2002:value"
+                    else self.construct_object(key_node)
+                )
+                try:
+                    duplicate = key in seen
+                    seen.add(key)
+                except TypeError as exc:
+                    raise yaml.constructor.ConstructorError(
+                        None, None, "unhashable mapping key", key_node.start_mark
+                    ) from exc
+                if duplicate:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        f"duplicate explicit key {'<<' if key is merge_key else key!r}",
+                        key_node.start_mark,
+                    )
+            self._checked.add(identity)
+        self._flattening.add(identity)
+        try:
+            super().flatten_mapping(node)
+        finally:
+            self._flattening.remove(identity)
+
+
 def load_config(path: Path) -> dict[str, Any]:
     try:
-        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+        payload = yaml.load(path.read_text(encoding="utf-8"), Loader=_StrictLoader)
     except OSError as exc:
         raise ConfigurationError(f"Could not read AutoSpan config {path}: {exc}") from exc
     except yaml.YAMLError as exc:
@@ -42,7 +89,7 @@ def apply_overrides(config: Mapping[str, Any], overrides: Iterable[str]) -> dict
         if not sep or not key or any(not part.strip() for part in key.split(".")):
             raise ConfigurationError(f"Override {raw!r} must look like dotted.key=value")
         try:
-            value = yaml.safe_load(value_text) if value_text.strip() else ""
+            value = yaml.load(value_text, Loader=_StrictLoader) if value_text.strip() else ""
         except yaml.YAMLError as exc:
             raise ConfigurationError(f"Override {raw!r} has an invalid YAML value: {exc}") from exc
         node: dict[str, Any] = result

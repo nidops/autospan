@@ -11,9 +11,11 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any, Generic, TypeVar
 
 from autospan.api.component import ComponentFactory, ComponentSpec, ResourceClaim
+from autospan.api.errors import LifecycleError
 
 PROVIDER_TYPE_ID = "autospan.provider"
 PROVIDER_ENTRY_POINT_GROUP = "autospan.providers"
@@ -62,25 +64,45 @@ class ProviderContribution:
 class LazyProvider(Generic[T]):
     """Provider opened on first resolve and closed by the active runtime.
 
-    Resolve/use only within the owning runtime scope. Callers must serialize
-    resolution; this facade does not coordinate concurrent first acquisitions.
+    Resolve/use only within the owning runtime scope. First acquisition is
+    serialized; a failed attempt may be explicitly retried after cleanup.
+    The runtime retires this facade before closing the acquired provider.
     """
 
     def __init__(self, opener: Callable[[], T]) -> None:
         self._opener = opener
         self._instance: T | None = None
         self._opened = False
+        self._closed = False
+        self._opening = False
+        self._lock = RLock()
 
     @property
     def opened(self) -> bool:
-        return self._opened
+        with self._lock:
+            return self._opened and not self._closed
+
+    def _retire(self) -> None:
+        """Owner-only invalidation; wait for acquisition before runtime cleanup."""
+        with self._lock:
+            self._closed = True
+            self._instance = None
 
     def resolve(self) -> T:
         """Return the cached instance, propagating acquisition or contract failures."""
-        if not self._opened:
-            self._instance = self._opener()
-            self._opened = True
-        return self._instance  # type: ignore[return-value]
+        with self._lock:
+            if self._closed:
+                raise LifecycleError("Lazy provider owner is closed")
+            if self._opening:
+                raise LifecycleError("Recursive lazy provider acquisition")
+            if not self._opened:
+                self._opening = True
+                try:
+                    self._instance = self._opener()
+                    self._opened = True
+                finally:
+                    self._opening = False
+            return self._instance  # type: ignore[return-value]
 
 
 def provider_component(

@@ -3,12 +3,16 @@
 The plain REPL, Textual UI and batch modes share one `CommandShell` and one
 runtime. Project commands reuse its live components and evidence.
 
+For a no-config console playground, run `python -m autospan.demos` with the
+`tui` extra installed. The [AutoSpan Lab guide](AUTOSPAN_LAB.md) covers this
+isolated simulation; it does not acquire project components or record evidence.
+
 ## Start in 60 seconds
 
-From the AutoSpan source checkout:
+Install AutoSpan and generate a hardware-free sample:
 
 ```bash
-python -m pip install -e '.[test,tui]'
+python -m pip install 'autospan[test,tui]==0.2.0'
 autospan new sample
 python -m pip install -e ./autospan-sample
 autospan console --config autospan-sample/autospan.yaml --plain --exec "sample status"
@@ -110,10 +114,17 @@ canonical session.
 
 - Enter submits; Up/Down recalls command paths; Tab completes and cycles matches;
   Shift+Tab cycles backwards.
-- Ctrl+P opens Textual's fuzzy command picker; Ctrl+Space and Ctrl+@ are aliases
-  because terminals may transmit either key for Ctrl+Space. The picker includes
-  built-ins and plugin commands; selecting one fills the prompt. Ctrl+P remains
-  the reliable default.
+- Ctrl+P opens Textual's global fuzzy command picker. It includes built-ins and
+  plugin commands; selecting one fills the prompt.
+- Ctrl+Space (or Ctrl+@, depending on the terminal) shows contextual suggestions
+  at the prompt cursor, using the shell's completion providers. An exact command
+  path such as `lab read` shows its next arguments without needing a trailing
+  space. Up/Down moves the highlight; Enter, Tab, or a mouse click inserts a
+  choice without executing. Shift+Tab moves up. Escape closes suggestions and
+  preserves the draft; Ctrl+C clears both. Editing refreshes choices, while
+  cursor movement or switching to search/the palette closes them. Suggestions
+  are unavailable while a worker is running or its output is draining. At most
+  50 choices are displayed; providers may still enumerate more candidates.
 - Ctrl+F searches retained log lines; Enter filters, an empty search restores them.
   Escape from the search field or command prompt closes search, clears the filter
   and restores retained output. It also works after pressing Enter to apply a search.
@@ -138,11 +149,24 @@ backpressure. Rendering drains a limited batch on the UI thread. Logs retain
 Output chunks are reassembled into lines before display; CRLF is normalized,
 blank lines are preserved, and long lines are split into display segments.
 Arguments are excluded from automatic history, command echoes and evidence
-labels. Error diagnostics replace exact argument values, including values after
-`=`. This does not redact secrets obtained from configuration, environment variables
-or devices, nor encoded/transformed arguments. Plugins must keep those values out
-of exceptions and evidence. `ctx.write()` can deliberately expose any content;
-clipboard/export intentionally includes that output.
+labels. By default, error diagnostics conservatively mask arguments, including
+values after `=`. Numeric values match complete tokens, so argument `1` does not
+change an unrelated `10` in an error. This default does not filter handler output.
+
+Commands can declare `sensitive_args=(1,)` to mark the second decoded argument
+sensitive (zero-based, excluding the command path). Only declared positions are
+masked in diagnostics, completion errors, and each `ctx.write()` call; public
+arguments remain readable. `sensitive_args=()` explicitly declares all arguments
+public. The default `None` preserves conservative diagnostics for older plugins.
+History and automatic command echoes remain argument-free in every mode.
+
+This is literal-value filtering, not a security sandbox. Numeric values match
+tokens; other declared values match literal occurrences. It does not identify
+secrets from configuration, environment variables or devices, transformed values,
+or values split across writes. Direct evidence events, opaque artifacts and
+arbitrary plugin I/O remain the plugin's responsibility. `CommandOutcome.error`
+retains the original exception in memory; never serialize its traceback, causes
+or notes into public logs. Clipboard/export includes retained console output.
 Plain-mode Tab/history requires `readline`; it is unavailable in standard
 Windows Python. Textual supplies those features on Windows.
 

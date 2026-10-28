@@ -5,6 +5,9 @@
 Use this guide when writing scenarios for an AutoSpan project plugin. Keep the
 requirement, operation and observed result visible to a reviewer.
 
+For mandatory CI verification, see [required gate coverage](RELIABILITY.md#required-verification-in-ci).
+Hardware authorization alone does not require any hardware test to pass.
+
 ## 1. Mental model
 
 ```text

@@ -17,7 +17,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.containers import Horizontal
-from textual.widgets import Footer, Header, Input, RichLog, Static
+from textual.widgets import Footer, Header, Input, OptionList, RichLog, Static
 
 from autospan.frontends.tui.editing import History
 from autospan.frontends.tui.streaming import LineAssembler
@@ -46,9 +46,25 @@ class PromptInput(Input):
     def watch_cursor_position(self) -> None:
         # Older Textual versions use a reactive cursor instead of a selection.
         self._completion_cycle = None
+        self._dismiss_stale_suggestions()
 
     def watch_selection(self) -> None:
         self._completion_cycle = None
+        self._dismiss_stale_suggestions()
+
+    def _dismiss_stale_suggestions(self) -> None:
+        if not self.is_mounted:
+            return
+        app = cast(ConsoleApp, self.app)
+        snapshot = app._suggestion_snapshot
+        # Typing refreshes via Input.Changed; cursor-only movement invalidates
+        # the token span, including movement by mouse or Ctrl+Left/Right.
+        if snapshot is not None and self.value == snapshot[0]:
+            if self.cursor_position != snapshot[1]:
+                app.dismiss_suggestions()
+
+    def on_blur(self) -> None:
+        cast(ConsoleApp, self.app).dismiss_suggestions()
 
     def _set(self, value: str) -> None:
         self._completion_cycle = None
@@ -56,10 +72,18 @@ class PromptInput(Input):
         self.cursor_position = len(value)
 
     def action_complete(self) -> None:
-        self._complete(direction=1)
+        app = cast(ConsoleApp, self.app)
+        if app.suggestions_open:
+            app.accept_suggestion()
+        else:
+            self._complete(direction=1)
 
     def action_complete_previous(self) -> None:
-        self._complete(direction=-1)
+        app = cast(ConsoleApp, self.app)
+        if app.suggestions_open:
+            app.move_suggestion(-1)
+        else:
+            self._complete(direction=-1)
 
     def _complete(self, *, direction: int) -> None:
         cycle = self._completion_cycle
@@ -100,10 +124,22 @@ class PromptInput(Input):
             app.record(completion.diagnostic)
 
     def action_history_previous(self) -> None:
-        self._set(self._history.previous(self.value))
+        app = cast(ConsoleApp, self.app)
+        if app.suggestions_open:
+            app.move_suggestion(-1)
+        else:
+            self._set(self._history.previous(self.value))
 
     def action_history_next(self) -> None:
-        self._set(self._history.next(self.value))
+        app = cast(ConsoleApp, self.app)
+        if app.suggestions_open:
+            app.move_suggestion(1)
+        else:
+            self._set(self._history.next(self.value))
+
+
+class SuggestionList(OptionList, can_focus=False):
+    """Mouse-selectable choices that leave keyboard editing in the prompt."""
 
 
 class ConsoleCommands(Provider):
@@ -148,15 +184,17 @@ class ConsoleApp(App[int]):
     CSS = """
     #side { width: 30; padding: 1; border-right: solid $primary-darken-2; }
     #log { height: 1fr; padding: 0 1; }
-    #search { display: none; }
+    #search, #suggestions, #suggestion-hint { display: none; }
+    #suggestions { height: auto; max-height: 10; border: round $primary; }
+    #suggestion-hint { padding: 0 1; color: $text-muted; }
     """
     BINDINGS = [
         Binding("ctrl+c", "cancel_command", "stop", priority=True),
         Binding("ctrl+q", "quit_console", "quit", priority=True),
         Binding("ctrl+p", "command_palette", "commands", priority=True),
-        # Many terminals send Ctrl+@ for Ctrl+Space; Ctrl+P remains the default.
-        Binding("ctrl+space", "command_palette", "commands", show=False, priority=True),
-        Binding("ctrl+@", "command_palette", "commands", show=False, priority=True),
+        # Ctrl+P searches globally; Ctrl+Space asks what belongs at the cursor.
+        Binding("ctrl+space", "browse_suggestions", "suggest", show=False, priority=True),
+        Binding("ctrl+@", "browse_suggestions", "suggest", show=False, priority=True),
         Binding("ctrl+f", "search_log", "search log", priority=True),
         Binding("ctrl+y", "copy_log", "copy log", priority=True),
         Binding("ctrl+s", "export_log", "export log", priority=True),
@@ -187,6 +225,8 @@ class ConsoleApp(App[int]):
         self._started_at: float | None = None
         self._finished_at: float | None = None
         self._last_duration: float | None = None
+        # (prompt value, cursor, completion input, completion snapshot)
+        self._suggestion_snapshot: tuple[str, int, str, Completion] | None = None
 
     @property
     def status(self) -> int:
@@ -216,16 +256,20 @@ class ConsoleApp(App[int]):
             placeholder="Search retained log; Enter filters, empty restores", id="search"
         )
         self._prompt = PromptInput(self.shell, self._history)
+        self._suggestion_hint = Static("", id="suggestion-hint", markup=False)
+        self._suggestions = SuggestionList(id="suggestions", markup=False)
         with Horizontal():
             yield self._side
             yield self._log_view
         yield self._search
+        yield self._suggestion_hint
+        yield self._suggestions
         yield self._prompt
         yield Footer()
 
     def on_mount(self) -> None:
         self.record(
-            "help / Tab completes / Ctrl+P picks / Ctrl+F searches / "
+            "help / Tab completes / Ctrl+Space suggests / Ctrl+P finds commands / "
             "Ctrl+B toggles details / Ctrl+C stops / Ctrl+Q quits"
         )
         self._prompt.focus()
@@ -263,7 +307,113 @@ class ConsoleApp(App[int]):
         for start in range(0, len(text), 2048):
             self._output.put(text[start : start + 2048])
 
+    @property
+    def suggestions_open(self) -> bool:
+        return self._suggestion_snapshot is not None
+
+    def dismiss_suggestions(self) -> None:
+        self._suggestion_snapshot = None
+        if hasattr(self, "_suggestions"):
+            self._suggestions.display = False
+            self._suggestion_hint.display = False
+
+    def action_browse_suggestions(self) -> None:
+        if (
+            self._thread is not None
+            or self.screen is not self._prompt.screen
+            or not self._prompt.has_focus
+        ):
+            return
+        self._refresh_suggestions()
+
+    def action_command_palette(self) -> None:
+        self.dismiss_suggestions()
+        super().action_command_palette()
+
+    def _refresh_suggestions(self) -> None:
+        """Request shell-owned completions, never execute or touch hardware."""
+        prompt = self._prompt
+        original, cursor = prompt.value, prompt.cursor_position
+        source = original
+        # Asking after an exact path (`lab`, `lab read`) means 'show children'.
+        # Insert a *virtual* separator so unfinished tokens still work normally.
+        prefix = tuple(original[:cursor].split())
+        if (
+            prefix
+            and cursor == len(original)
+            and not original[-1].isspace()
+            and any(command.path[: len(prefix)] == prefix for command in self.shell.commands)
+        ):
+            source += " "
+        completion = self.shell.completion(source, len(source) if source != original else cursor)
+        self.dismiss_suggestions()
+        if completion.diagnostic:
+            self.record(completion.diagnostic)
+        if not completion.choices:
+            return
+        self._suggestion_snapshot = (original, cursor, source, completion)
+        # Limit rendering. Legacy completers still enumerate all candidates;
+        # a future bounded provider API can improve upstream performance.
+        candidates = completion.choices[:50]
+        shown = tuple(choice.replace("\r", "␍").replace("\n", "↵")[:120] for choice in candidates)
+        self._suggestions.clear_options()
+        self._suggestions.add_options(shown)
+        self._suggestions.highlighted = 0
+        self._suggestions.display = True
+        more = " | showing first 50" if len(completion.choices) > 50 else ""
+        self._suggestion_hint.update(
+            f"Suggestions: {len(completion.choices)}{more} | ↑/↓ move | Enter insert | Esc close"
+        )
+        self._suggestion_hint.display = True
+        prompt.focus()
+
+    def move_suggestion(self, direction: int) -> None:
+        if self._suggestion_snapshot is None:
+            return
+        count = self._suggestions.option_count
+        if not count:
+            return
+        current = self._suggestions.highlighted
+        self._suggestions.highlighted = ((0 if current is None else current) + direction) % count
+        self._suggestions.scroll_to_highlight()
+
+    def accept_suggestion(self, index: int | None = None) -> None:
+        snapshot = self._suggestion_snapshot
+        if snapshot is None:
+            return
+        original, cursor, source, completion = snapshot
+        if self._prompt.value != original or self._prompt.cursor_position != cursor:
+            self.dismiss_suggestions()
+            return
+        index = self._suggestions.highlighted if index is None else index
+        if index is None or not 0 <= index < self._suggestions.option_count:
+            return
+        one = Completion(
+            completion.start,
+            completion.end,
+            (completion.choices[index],),
+            completion.quote,
+        )
+        value, position = one.apply(source)
+        self.dismiss_suggestions()
+        self._prompt._set(value)
+        self._prompt.cursor_position = position
+        self._prompt.focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list is self._suggestions:
+            event.stop()
+            self.accept_suggestion(event.option_index)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input is self._prompt and self.suggestions_open:
+            if event.value.strip():
+                self._refresh_suggestions()
+            else:
+                self.dismiss_suggestions()
+
     def select_command(self, label: str) -> None:
+        self.dismiss_suggestions()
         prompt = self._prompt
         prompt._set(label + " ")
         prompt.focus()
@@ -274,6 +424,10 @@ class ConsoleApp(App[int]):
             self._filter = event.value.casefold()
             self._render_log()
             self._prompt.focus()
+            return
+        if self.suggestions_open:
+            # Selecting a suggestion must NEVER execute the current command.
+            self.accept_suggestion()
             return
         line = event.value.strip()
         if not line:
@@ -389,6 +543,7 @@ class ConsoleApp(App[int]):
         if self.screen is not self._prompt.screen:
             return
 
+        self.dismiss_suggestions()
         if self._search.display:
             self._close_search()
 
@@ -413,6 +568,11 @@ class ConsoleApp(App[int]):
         search.focus()
 
     def on_key(self, event: events.Key) -> None:
+        if self.suggestions_open and event.key == "escape":
+            self.dismiss_suggestions()
+            event.stop()
+            event.prevent_default()
+            return
         if (
             event.key == "escape"
             and self._search.display

@@ -192,6 +192,10 @@ def test_shutdown_waits_through_handover_recovery_and_diagnostics(
         assert len(shutdown_errors) == 1
         assert isinstance(shutdown_errors[0], LifecycleError)
         assert shutdown_errors[0].__cause__ is cleanup_error
+    elif recovery_error is not None:
+        assert len(shutdown_errors) == 1
+        assert isinstance(shutdown_errors[0], LifecycleError)
+        assert "not recovered" in str(shutdown_errors[0])
     else:
         assert shutdown_errors == []
     assert log[:4] == ["open:a", "open:b", "release:b", "release:a"]
@@ -199,15 +203,17 @@ def test_shutdown_waits_through_handover_recovery_and_diagnostics(
     with exclusive:
         pass
     if cleanup_error is None:
-        with session as reused:
-            if recovery_error is None:
+        if recovery_error is None:
+            with session as reused:
                 with reused.handover("handover:shutdown"):
                     pass
-            else:
-                with pytest.raises(LifecycleError) as failure:
-                    with reused.handover("handover:shutdown"):
-                        pass
-                assert failure.value.__cause__ is recovery_error
+        else:
+            with pytest.raises(LifecycleError, match="not recovered"):
+                with session as reused:
+                    with pytest.raises(LifecycleError) as failure:
+                        with reused.handover("handover:shutdown"):
+                            pass
+                    assert failure.value.__cause__ is recovery_error
     with exclusive:
         pass
 
